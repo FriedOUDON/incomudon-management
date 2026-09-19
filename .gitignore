@@ -1,0 +1,4 @@
+.git
+.env
+management-pcl/*
+!management-pcl/README.md
