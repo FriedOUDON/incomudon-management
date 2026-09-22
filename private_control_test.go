@@ -68,3 +68,20 @@ func TestManagementStateDoesNotRetainLifecycleEvents(t *testing.T) {
 		t.Fatal("state did not record disconnection")
 	}
 }
+
+func TestPrivateControlUDSClientDoesNotRequireTLSMaterial(t *testing.T) {
+	client, err := newPrivateControlClient(privateControlClientConfig{
+		transport: privateControlTransportUDS, udsSocketPath: "/run/incomudon-pcl/relay.sock", serviceID: "management-main",
+	}, &managementState{})
+	if err != nil {
+		t.Fatalf("new UDS client: %v", err)
+	}
+	if client.tlsConfig != nil {
+		t.Fatal("UDS client unexpectedly configured TLS")
+	}
+	if _, err := newPrivateControlClient(privateControlClientConfig{
+		transport: privateControlTransportUDS, udsSocketPath: "relative.sock", serviceID: "management-main",
+	}, &managementState{}); err == nil {
+		t.Fatal("UDS client accepted a relative socket path")
+	}
+}

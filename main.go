@@ -117,16 +117,20 @@ func main() {
 }
 
 func loadConfiguration() (privateControlClientConfig, string) {
-	relayAddress := flag.String("pcl-relay-address", os.Getenv("INCOMUDON_MANAGEMENT_PCL_RELAY_ADDRESS"), "Relay Private Control Link address")
+	transport := flag.String("pcl-transport", os.Getenv("INCOMUDON_MANAGEMENT_PCL_TRANSPORT"), "Private Control Link transport: uds or mtls-tcp")
+	relayAddress := flag.String("pcl-relay-address", os.Getenv("INCOMUDON_MANAGEMENT_PCL_RELAY_ADDRESS"), "Relay Private Control Link mTLS address")
+	udsSocketPath := flag.String("pcl-uds-socket-path", os.Getenv("INCOMUDON_MANAGEMENT_PCL_UDS_SOCKET_PATH"), "Relay Private Control Link UDS absolute socket path")
 	serverName := flag.String("pcl-server-name", os.Getenv("INCOMUDON_MANAGEMENT_PCL_SERVER_NAME"), "expected Relay TLS server name")
 	serviceID := flag.String("pcl-service-id", os.Getenv("INCOMUDON_MANAGEMENT_PCL_SERVICE_ID"), "Management Service ID")
-	certificateFile := flag.String("pcl-cert-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_CERT_FILE"), "Management Service client certificate PEM file")
-	privateKeyFile := flag.String("pcl-key-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_KEY_FILE"), "Management Service client private key PEM file")
-	relayCAFile := flag.String("pcl-relay-ca-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_RELAY_CA_FILE"), "trusted Relay CA PEM file")
+	certificateFile := flag.String("pcl-cert-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_CERT_FILE"), "Management Service mTLS client certificate PEM file")
+	privateKeyFile := flag.String("pcl-key-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_KEY_FILE"), "Management Service mTLS client private key PEM file")
+	relayCAFile := flag.String("pcl-relay-ca-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_RELAY_CA_FILE"), "trusted Relay mTLS CA PEM file")
 	httpListen := flag.String("http-listen", valueOrDefault(os.Getenv("INCOMUDON_MANAGEMENT_HTTP_LISTEN"), ":8080"), "local management health listener")
 	flag.Parse()
 	return privateControlClientConfig{
+		transport:       *transport,
 		relayAddress:    *relayAddress,
+		udsSocketPath:   *udsSocketPath,
 		serverName:      *serverName,
 		serviceID:       *serviceID,
 		certificateFile: *certificateFile,

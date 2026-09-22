@@ -1,8 +1,8 @@
 # IncomUdon Management Service
 
 This repository contains the independently deployed Management Service for
-IncomUdon. It connects to a Relay's Private Control Link v1 listener with TLS
-1.3 mutual TLS and consumes live, redacted lifecycle events.
+IncomUdon. It connects to a Relay's Private Control Link v1 and consumes live,
+redacted lifecycle events.
 
 ## Current P1 scope
 
@@ -18,26 +18,32 @@ only while the authenticated Private Control Link session is connected. Do not
 publish this listener directly; place a future management API behind its own
 private mTLS or ingress boundary.
 
-## Configuration
+## Private Control Link transport
 
-Copy `.env.example` into deployment configuration. The Management Service
-requires its own client certificate and private key, plus the CA used to
-validate the Relay certificate:
+The client selects exactly one Private Control Link transport. It never falls
+back automatically between transports.
 
-```text
-management-pcl/
-  client.crt
-  client.key
-  relay-ca.crt
-```
+### Same-host UDS profile
 
-The Relay separately receives its server certificate/key, the trusted client
-CA, and `services.csv` mapping this client certificate's lowercase DER
-SHA-256 digest to `INCOMUDON_MANAGEMENT_PCL_SERVICE_ID`.
+Use `INCOMUDON_MANAGEMENT_PCL_TRANSPORT=uds` and an absolute
+`INCOMUDON_MANAGEMENT_PCL_UDS_SOCKET_PATH`. This is the standard profile for
+the Relay repository's bundled Compose overlay. TLS material is not used for
+this profile: the Relay authenticates the client with Linux `SO_PEERCRED` and a
+local UID-to-service-ID policy. The `INCOMUDON_MANAGEMENT_PCL_SERVICE_ID` sent
+in `hello` must exactly match that Relay-side mapping.
 
-The server certificate must contain the configured
-`INCOMUDON_MANAGEMENT_PCL_SERVER_NAME` as a DNS SAN. In the bundled Compose
-overlay, the default is `relay`.
+The socket volume must be shared read-write so the client can connect, but the
+Management Service must not have write access to the socket's parent directory.
+The bundled overlay runs this service as UID `10002` with supplementary group
+`10003`; configure the Relay's `uds-services.csv` accordingly.
+
+### Cross-host mTLS TCP profile
+
+Use `INCOMUDON_MANAGEMENT_PCL_TRANSPORT=mtls-tcp` when the Management Service
+is on another host. It requires a Relay address, TLS server name, client
+certificate, client private key, and trusted Relay CA. The Relay maps the
+verified client certificate to `INCOMUDON_MANAGEMENT_PCL_SERVICE_ID` using its
+separate PCL authorization policy.
 
 ## Container publishing
 
@@ -50,13 +56,20 @@ ghcr.io/friedoudon/incomudon-management:v0.1.0
 ```
 
 The Relay repository provides `compose.management.yaml` to run this image with
-the Relay over an internal-only Docker network.
+the Relay through a local UDS volume.
 
 ## Development
 
 ```bash
-go test ./...
+# Same-host UDS
 go run . \
+  -pcl-transport uds \
+  -pcl-uds-socket-path /run/incomudon-pcl/relay.sock \
+  -pcl-service-id management-main
+
+# Cross-host mTLS TCP
+go run . \
+  -pcl-transport mtls-tcp \
   -pcl-relay-address 127.0.0.1:9443 \
   -pcl-server-name relay.example.internal \
   -pcl-service-id management-main \

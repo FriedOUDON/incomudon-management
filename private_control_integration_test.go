@@ -48,7 +48,7 @@ func TestPrivateControlClientConsumesRelayLifecycleEvent(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		if hello.SchemaVersion != privateControlSchemaVersion || hello.Type != "hello" || hello.ManagementServiceID != clientConfig.serviceID || hello.WantLifecycleEvents == nil || !*hello.WantLifecycleEvents || hello.WantAuditInputs == nil || *hello.WantAuditInputs {
+		if hello.SchemaVersion != privateControlSchemaVersion || hello.Type != "hello" || hello.ManagementServiceID != clientConfig.serviceID || hello.WantLifecycleEvents == nil || !*hello.WantLifecycleEvents || hello.WantAuditInputs == nil || *hello.WantAuditInputs || hello.WantDiagnostics == nil || *hello.WantDiagnostics {
 			serverDone <- errUnexpectedPrivateControlHello
 			return
 		}
@@ -69,8 +69,9 @@ func TestPrivateControlClientConsumesRelayLifecycleEvent(t *testing.T) {
 			InReplyTo:               hello.MessageID,
 			SessionID:               sessionID,
 			RelayID:                 "relay-test",
-			LifecycleEventsAccepted: true,
-			AuditInputsAccepted:     false,
+			LifecycleEventsAccepted: boolPointer(true),
+			AuditInputsAccepted:     boolPointer(false),
+			DiagnosticsAccepted:     boolPointer(false),
 		}); err != nil {
 			serverDone <- err
 			return
@@ -165,6 +166,7 @@ func newPrivateControlTestCredentials(t *testing.T) (*tls.Config, privateControl
 			ClientAuth:   tls.RequireAndVerifyClientCert,
 			ClientCAs:    roots,
 		}, privateControlClientConfig{
+			transport:       privateControlTransportMTLSTCP,
 			serverName:      "relay.test",
 			serviceID:       "management-main",
 			certificateFile: certificatePath,
@@ -205,3 +207,5 @@ func newPrivateControlTestLeaf(t *testing.T, issuer *x509.Certificate, issuerKey
 }
 
 func stringPointer(value string) *string { return &value }
+
+func boolPointer(value bool) *bool { return &value }

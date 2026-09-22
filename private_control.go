@@ -15,21 +15,26 @@ import (
 	"log"
 	"net"
 	"os"
+	"path"
 	"regexp"
 	"strings"
 	"time"
 )
 
 const (
-	privateControlSchemaVersion = "private-control-link-v1"
-	privateControlMaxFrameBytes = 65536
-	privateControlTLSMinVersion = tls.VersionTLS13
+	privateControlSchemaVersion    = "private-control-link-v1"
+	privateControlMaxFrameBytes    = 65536
+	privateControlTLSMinVersion    = tls.VersionTLS13
+	privateControlTransportMTLSTCP = "mtls-tcp"
+	privateControlTransportUDS     = "uds"
 )
 
 var privateControlEventNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
 type privateControlClientConfig struct {
+	transport       string
 	relayAddress    string
+	udsSocketPath   string
 	serverName      string
 	serviceID       string
 	certificateFile string
@@ -50,6 +55,7 @@ type privateControlHello struct {
 	ManagementServiceID string `json:"management_service_id"`
 	WantLifecycleEvents *bool  `json:"want_lifecycle_events"`
 	WantAuditInputs     *bool  `json:"want_audit_inputs"`
+	WantDiagnostics     *bool  `json:"want_diagnostics"`
 }
 
 type privateControlHelloAck struct {
@@ -59,8 +65,9 @@ type privateControlHelloAck struct {
 	InReplyTo               string `json:"in_reply_to"`
 	SessionID               string `json:"session_id"`
 	RelayID                 string `json:"relay_id"`
-	LifecycleEventsAccepted bool   `json:"lifecycle_events_accepted"`
-	AuditInputsAccepted     bool   `json:"audit_inputs_accepted"`
+	LifecycleEventsAccepted *bool  `json:"lifecycle_events_accepted"`
+	AuditInputsAccepted     *bool  `json:"audit_inputs_accepted"`
+	DiagnosticsAccepted     *bool  `json:"diagnostics_accepted"`
 }
 
 type privateControlEnvelope struct {
@@ -92,33 +99,42 @@ type privateControlLifecycleEvent struct {
 }
 
 func newPrivateControlClient(config privateControlClientConfig, state *managementState) (*privateControlClient, error) {
-	if state == nil || strings.TrimSpace(config.relayAddress) == "" || strings.TrimSpace(config.serverName) == "" ||
-		!validManagementServiceID(config.serviceID) || strings.TrimSpace(config.certificateFile) == "" ||
-		strings.TrimSpace(config.privateKeyFile) == "" || strings.TrimSpace(config.relayCAFile) == "" {
-		return nil, errors.New("Relay address, server name, service ID, client certificate/key, and Relay CA are required")
+	if state == nil || !validManagementServiceID(config.serviceID) {
+		return nil, errors.New("Management Service ID is required")
 	}
-	certificate, err := tls.LoadX509KeyPair(config.certificateFile, config.privateKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load Management Service client certificate: %w", err)
-	}
-	caData, err := os.ReadFile(config.relayCAFile)
-	if err != nil {
-		return nil, fmt.Errorf("read Relay CA: %w", err)
-	}
-	roots := x509.NewCertPool()
-	if !roots.AppendCertsFromPEM(caData) {
-		return nil, errors.New("Relay CA contains no certificates")
-	}
-	return &privateControlClient{
-		config: config,
-		tlsConfig: &tls.Config{
+	client := &privateControlClient{config: config, state: state}
+	switch config.transport {
+	case privateControlTransportMTLSTCP:
+		if strings.TrimSpace(config.relayAddress) == "" || strings.TrimSpace(config.serverName) == "" ||
+			strings.TrimSpace(config.certificateFile) == "" || strings.TrimSpace(config.privateKeyFile) == "" || strings.TrimSpace(config.relayCAFile) == "" {
+			return nil, errors.New("mTLS Relay address, server name, client certificate/key, and Relay CA are required")
+		}
+		certificate, err := tls.LoadX509KeyPair(config.certificateFile, config.privateKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("load Management Service client certificate: %w", err)
+		}
+		caData, err := os.ReadFile(config.relayCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read Relay CA: %w", err)
+		}
+		roots := x509.NewCertPool()
+		if !roots.AppendCertsFromPEM(caData) {
+			return nil, errors.New("Relay CA contains no certificates")
+		}
+		client.tlsConfig = &tls.Config{
 			MinVersion:   privateControlTLSMinVersion,
 			Certificates: []tls.Certificate{certificate},
 			RootCAs:      roots,
 			ServerName:   config.serverName,
-		},
-		state: state,
-	}, nil
+		}
+	case privateControlTransportUDS:
+		if !path.IsAbs(config.udsSocketPath) {
+			return nil, errors.New("UDS socket path must be absolute")
+		}
+	default:
+		return nil, fmt.Errorf("Private Control Link transport must be %q or %q", privateControlTransportUDS, privateControlTransportMTLSTCP)
+	}
+	return client, nil
 }
 
 func (c *privateControlClient) run(context context.Context) {
@@ -147,12 +163,22 @@ func (c *privateControlClient) run(context context.Context) {
 }
 
 func (c *privateControlClient) runSession(context context.Context) error {
-	dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: c.tlsConfig}
-	rawConnection, err := dialer.DialContext(context, "tcp", c.config.relayAddress)
+	var (
+		connection net.Conn
+		err        error
+	)
+	switch c.config.transport {
+	case privateControlTransportMTLSTCP:
+		dialer := &tls.Dialer{NetDialer: &net.Dialer{Timeout: 5 * time.Second}, Config: c.tlsConfig}
+		connection, err = dialer.DialContext(context, "tcp", c.config.relayAddress)
+	case privateControlTransportUDS:
+		connection, err = (&net.Dialer{Timeout: 5 * time.Second}).DialContext(context, "unix", c.config.udsSocketPath)
+	default:
+		return fmt.Errorf("unsupported Private Control Link transport %q", c.config.transport)
+	}
 	if err != nil {
 		return err
 	}
-	connection := rawConnection
 	defer connection.Close()
 	sessionDone := make(chan struct{})
 	go func() {
@@ -168,7 +194,7 @@ func (c *privateControlClient) runSession(context context.Context) error {
 	if err != nil {
 		return err
 	}
-	wantEvents, wantAuditInputs := true, false
+	wantEvents, wantAuditInputs, wantDiagnostics := true, false, false
 	if err := writePrivateControlFrame(connection, privateControlHello{
 		SchemaVersion:       privateControlSchemaVersion,
 		Type:                "hello",
@@ -176,6 +202,7 @@ func (c *privateControlClient) runSession(context context.Context) error {
 		ManagementServiceID: c.config.serviceID,
 		WantLifecycleEvents: &wantEvents,
 		WantAuditInputs:     &wantAuditInputs,
+		WantDiagnostics:     &wantDiagnostics,
 	}); err != nil {
 		return err
 	}
@@ -190,11 +217,14 @@ func (c *privateControlClient) runSession(context context.Context) error {
 	if !validPrivateControlHelloAck(ack, messageID) {
 		return errors.New("invalid Private Control Link hello_ack")
 	}
-	if !ack.LifecycleEventsAccepted {
+	if !*ack.LifecycleEventsAccepted {
 		return errors.New("Relay rejected lifecycle event export")
 	}
-	if ack.AuditInputsAccepted {
+	if *ack.AuditInputsAccepted {
 		return errors.New("Relay accepted unsupported audit inputs")
+	}
+	if *ack.DiagnosticsAccepted {
+		return errors.New("Relay accepted unsupported diagnostics")
 	}
 	c.state.markConnected(ack.RelayID)
 
@@ -258,7 +288,8 @@ func validPrivateControlID(value string) bool {
 func validPrivateControlHelloAck(ack privateControlHelloAck, inReplyTo string) bool {
 	return ack.SchemaVersion == privateControlSchemaVersion && ack.Type == "hello_ack" &&
 		validPrivateControlID(ack.MessageID) && ack.InReplyTo == inReplyTo &&
-		validPrivateControlID(ack.SessionID) && strings.TrimSpace(ack.RelayID) != "" && len(ack.RelayID) <= 128
+		validPrivateControlID(ack.SessionID) && strings.TrimSpace(ack.RelayID) != "" && len(ack.RelayID) <= 128 &&
+		ack.LifecycleEventsAccepted != nil && ack.AuditInputsAccepted != nil && ack.DiagnosticsAccepted != nil
 }
 
 func validPrivateControlLifecycleEvent(event privateControlLifecycleEvent) bool {
