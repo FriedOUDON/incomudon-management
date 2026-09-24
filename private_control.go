@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -29,7 +30,29 @@ const (
 	privateControlTransportUDS     = "uds"
 )
 
-var privateControlEventNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
+var (
+	privateControlLifecycleEventTypes = map[string]struct{}{
+		"participant_joined":        {},
+		"participant_left":          {},
+		"talk_started":              {},
+		"talk_ended":                {},
+		"relay_health_changed":      {},
+		"recording_state_changed":   {},
+		"service_admission_issued":  {},
+		"service_admission_revoked": {},
+	}
+	privateControlLifecycleStates = map[string]struct{}{
+		"healthy": {}, "degraded": {}, "unhealthy": {}, "starting": {},
+		"recording": {}, "stopping": {}, "stopped": {}, "failed": {},
+	}
+	privateControlErrorCodes = map[string]struct{}{
+		"handshake_required": {}, "identity_mismatch": {}, "unsupported_message": {},
+		"invalid_revocation_target": {}, "invalid_revocation_deadline": {},
+		"unauthorized": {}, "overloaded": {}, "internal_error": {},
+	}
+	privateControlServiceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	privateControlReasonPattern    = regexp.MustCompile(`^[A-Z0-9_:-]+$`)
+)
 
 type privateControlClientConfig struct {
 	transport       string
@@ -74,6 +97,39 @@ type privateControlEnvelope struct {
 	SchemaVersion string `json:"schema_version"`
 	Type          string `json:"type"`
 	MessageID     string `json:"message_id"`
+}
+
+type privateControlGetRelayStateSnapshot struct {
+	SchemaVersion string `json:"schema_version"`
+	Type          string `json:"type"`
+	MessageID     string `json:"message_id"`
+}
+
+type privateControlSnapshotParticipant struct {
+	SenderID uint32 `json:"sender_id"`
+	State    string `json:"state"`
+}
+
+type privateControlSnapshotChannel struct {
+	ChannelID    uint32                              `json:"channel_id"`
+	Participants []privateControlSnapshotParticipant `json:"participants"`
+}
+
+type privateControlRelayStateSnapshot struct {
+	SchemaVersion string                          `json:"schema_version"`
+	Type          string                          `json:"type"`
+	MessageID     string                          `json:"message_id"`
+	InReplyTo     string                          `json:"in_reply_to"`
+	SnapshotID    string                          `json:"snapshot_id"`
+	ChunkIndex    uint16                          `json:"chunk_index"`
+	ChunkCount    uint16                          `json:"chunk_count"`
+	Channels      []privateControlSnapshotChannel `json:"channels"`
+}
+
+type privateControlSnapshotReassembly struct {
+	snapshotID string
+	chunkCount uint16
+	chunks     map[uint16][]privateControlSnapshotChannel
 }
 
 type privateControlError struct {
@@ -227,6 +283,18 @@ func (c *privateControlClient) runSession(context context.Context) error {
 		return errors.New("Relay accepted unsupported diagnostics")
 	}
 	c.state.markConnected(ack.RelayID)
+	snapshotRequestID, err := newPrivateControlID()
+	if err != nil {
+		return err
+	}
+	if err := writePrivateControlFrame(connection, privateControlGetRelayStateSnapshot{
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          "get_relay_state_snapshot",
+		MessageID:     snapshotRequestID,
+	}); err != nil {
+		return err
+	}
+	var snapshot *privateControlSnapshotReassembly
 
 	for {
 		rawMessage, err := readPrivateControlFrame(connection)
@@ -243,16 +311,31 @@ func (c *privateControlClient) runSession(context context.Context) error {
 			if err := decodePrivateControlJSON(rawMessage, &event); err != nil {
 				return err
 			}
-			if !validPrivateControlLifecycleEvent(event) {
+			if !validPrivateControlLifecycleEvent(rawMessage, event) {
 				return errors.New("invalid Relay lifecycle event")
 			}
 			c.state.recordLifecycleEvent(event)
+		case "relay_state_snapshot":
+			var response privateControlRelayStateSnapshot
+			if err := decodePrivateControlJSON(rawMessage, &response); err != nil || !validPrivateControlRelayStateSnapshot(response) || response.InReplyTo != snapshotRequestID {
+				return errors.New("invalid Relay state snapshot")
+			}
+			if snapshot == nil {
+				snapshot = &privateControlSnapshotReassembly{snapshotID: response.SnapshotID, chunkCount: response.ChunkCount, chunks: make(map[uint16][]privateControlSnapshotChannel)}
+			}
+			complete, channels, err := snapshot.add(response)
+			if err != nil {
+				return err
+			}
+			if complete {
+				c.state.applyRelayStateSnapshot(channels)
+			}
 		case "error":
 			var response privateControlError
 			if err := decodePrivateControlJSON(rawMessage, &response); err != nil {
 				return err
 			}
-			if response.SchemaVersion != privateControlSchemaVersion || !validPrivateControlID(response.MessageID) || response.Code == "" {
+			if !validPrivateControlError(response) {
 				return errors.New("invalid Private Control Link error")
 			}
 			return fmt.Errorf("Relay Private Control Link error: %s", response.Code)
@@ -263,10 +346,7 @@ func (c *privateControlClient) runSession(context context.Context) error {
 }
 
 func validManagementServiceID(value string) bool {
-	if len(value) == 0 || len(value) > 128 {
-		return false
-	}
-	return regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`).MatchString(value)
+	return privateControlServiceIDPattern.MatchString(value)
 }
 
 func newPrivateControlID() (string, error) {
@@ -292,13 +372,125 @@ func validPrivateControlHelloAck(ack privateControlHelloAck, inReplyTo string) b
 		ack.LifecycleEventsAccepted != nil && ack.AuditInputsAccepted != nil && ack.DiagnosticsAccepted != nil
 }
 
-func validPrivateControlLifecycleEvent(event privateControlLifecycleEvent) bool {
+func validPrivateControlLifecycleEvent(raw []byte, event privateControlLifecycleEvent) bool {
 	if event.SchemaVersion != privateControlSchemaVersion || event.Type != "relay_lifecycle_event" ||
-		!validPrivateControlID(event.MessageID) || !privateControlEventNamePattern.MatchString(event.EventType) {
+		!validPrivateControlID(event.MessageID) || !validPrivateControlUTCTimestamp(event.OccurredAt) {
 		return false
 	}
-	_, err := time.Parse(time.RFC3339, event.OccurredAt)
-	return err == nil
+	if _, ok := privateControlLifecycleEventTypes[event.EventType]; !ok {
+		return false
+	}
+	if event.SenderID != nil && *event.SenderID == 0 {
+		return false
+	}
+	if event.ServiceID != nil && !validManagementServiceID(*event.ServiceID) {
+		return false
+	}
+	if event.RecordingJobID != nil && !validPrivateControlStringLength(*event.RecordingJobID, 1, 128) {
+		return false
+	}
+	if event.State != nil {
+		if _, ok := privateControlLifecycleStates[*event.State]; !ok {
+			return false
+		}
+	}
+	if event.Reason != nil && (!validPrivateControlStringLength(*event.Reason, 1, 128) || !privateControlReasonPattern.MatchString(*event.Reason)) {
+		return false
+	}
+
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return false
+	}
+	channelJSON, hasChannelID := members["channel_id"]
+	if !hasChannelID {
+		return false
+	}
+	if event.EventType == "relay_health_changed" {
+		if event.ChannelID != nil || !bytes.Equal(bytes.TrimSpace(channelJSON), []byte("null")) || event.State == nil {
+			return false
+		}
+		_, isHealthState := map[string]struct{}{"healthy": {}, "degraded": {}, "unhealthy": {}}[*event.State]
+		return isHealthState
+	}
+	return event.ChannelID != nil
+}
+
+func validPrivateControlUTCTimestamp(value string) bool {
+	parsed, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return false
+	}
+	_, offset := parsed.Zone()
+	return offset == 0
+}
+
+func validPrivateControlStringLength(value string, minimum, maximum int) bool {
+	length := utf8.RuneCountInString(value)
+	return length >= minimum && length <= maximum
+}
+
+func validPrivateControlError(response privateControlError) bool {
+	if response.SchemaVersion != privateControlSchemaVersion || response.Type != "error" || !validPrivateControlID(response.MessageID) {
+		return false
+	}
+	if response.InReplyTo != "" && !validPrivateControlID(response.InReplyTo) {
+		return false
+	}
+	_, ok := privateControlErrorCodes[response.Code]
+	return ok
+}
+
+func validPrivateControlRelayStateSnapshot(snapshot privateControlRelayStateSnapshot) bool {
+	if snapshot.SchemaVersion != privateControlSchemaVersion || snapshot.Type != "relay_state_snapshot" ||
+		!validPrivateControlID(snapshot.MessageID) || !validPrivateControlID(snapshot.InReplyTo) || !validPrivateControlID(snapshot.SnapshotID) ||
+		snapshot.ChunkCount == 0 || snapshot.ChunkCount > 64 || snapshot.ChunkIndex >= snapshot.ChunkCount || snapshot.Channels == nil {
+		return false
+	}
+	for _, channel := range snapshot.Channels {
+		for _, participant := range channel.Participants {
+			if participant.SenderID == 0 || (participant.State != "joined" && participant.State != "talking" && participant.State != "idle") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (r *privateControlSnapshotReassembly) add(snapshot privateControlRelayStateSnapshot) (bool, []privateControlSnapshotChannel, error) {
+	if snapshot.SnapshotID != r.snapshotID || snapshot.ChunkCount != r.chunkCount {
+		return false, nil, errors.New("inconsistent Relay state snapshot")
+	}
+	if _, duplicate := r.chunks[snapshot.ChunkIndex]; duplicate {
+		return false, nil, errors.New("duplicate Relay state snapshot chunk")
+	}
+	r.chunks[snapshot.ChunkIndex] = snapshot.Channels
+	if len(r.chunks) != int(r.chunkCount) {
+		return false, nil, nil
+	}
+	channels := make([]privateControlSnapshotChannel, 0)
+	seen := make(map[uint32]map[uint32]struct{})
+	for index := uint16(0); index < r.chunkCount; index++ {
+		chunk, found := r.chunks[index]
+		if !found {
+			return false, nil, errors.New("incomplete Relay state snapshot")
+		}
+		for _, channel := range chunk {
+			ids := seen[channel.ChannelID]
+			if ids == nil {
+				ids = make(map[uint32]struct{})
+				seen[channel.ChannelID] = ids
+			}
+			for _, participant := range channel.Participants {
+				if _, duplicate := ids[participant.SenderID]; duplicate {
+					return false, nil, errors.New("duplicate Relay snapshot participant")
+				}
+				ids[participant.SenderID] = struct{}{}
+			}
+			channels = append(channels, channel)
+		}
+	}
+	return true, channels, nil
 }
 
 func decodePrivateControlEnvelope(raw []byte) (privateControlEnvelope, error) {
@@ -377,6 +569,9 @@ func decodePrivateControlJSON(raw []byte, target any) error {
 }
 
 func validatePrivateControlJSON(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return errors.New("malformed UTF-8")
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	if err := scanPrivateControlJSONValue(decoder); err != nil {
 		return err

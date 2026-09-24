@@ -76,6 +76,49 @@ func TestPrivateControlClientConsumesRelayLifecycleEvent(t *testing.T) {
 			serverDone <- err
 			return
 		}
+		rawSnapshotRequest, err := readPrivateControlFrame(connection)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		var snapshotRequest privateControlGetRelayStateSnapshot
+		if err := decodePrivateControlJSON(rawSnapshotRequest, &snapshotRequest); err != nil {
+			serverDone <- err
+			return
+		}
+		if snapshotRequest.SchemaVersion != privateControlSchemaVersion || snapshotRequest.Type != "get_relay_state_snapshot" || !validPrivateControlID(snapshotRequest.MessageID) {
+			serverDone <- errUnexpectedPrivateControlHello
+			return
+		}
+		snapshotMessageID, err := newPrivateControlID()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		snapshotID, err := newPrivateControlID()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if err := writePrivateControlFrame(connection, privateControlRelayStateSnapshot{
+			SchemaVersion: privateControlSchemaVersion,
+			Type:          "relay_state_snapshot",
+			MessageID:     snapshotMessageID,
+			InReplyTo:     snapshotRequest.MessageID,
+			SnapshotID:    snapshotID,
+			ChunkIndex:    0,
+			ChunkCount:    1,
+			Channels: []privateControlSnapshotChannel{{
+				ChannelID: 100,
+				Participants: []privateControlSnapshotParticipant{{
+					SenderID: 1,
+					State:    "idle",
+				}},
+			}},
+		}); err != nil {
+			serverDone <- err
+			return
+		}
 		eventID, err := newPrivateControlID()
 		if err != nil {
 			serverDone <- err
