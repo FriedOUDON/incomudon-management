@@ -2,11 +2,126 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"testing"
 	"time"
 )
+
+func TestPrivateControlClientCompletesQueuedRevocationFromAcknowledgement(t *testing.T) {
+	client := &privateControlClient{
+		state:         newManagementState(),
+		pending:       make(map[string]*privateControlPendingCommand),
+		commandNotify: make(chan struct{}, 1),
+	}
+	result := make(chan struct {
+		ack privateControlAck
+		id  string
+		err error
+	}, 1)
+	go func() {
+		ack, id, err := client.revokeServiceAdmission(context.Background(), managementServiceAdmissionRevocationRequest{
+			ChannelID: 100, ServiceID: "recorder-01", Reason: "service_disabled", DenyUntil: time.Now().Add(time.Minute).Unix(),
+		})
+		result <- struct {
+			ack privateControlAck
+			id  string
+			err error
+		}{ack, id, err}
+	}()
+
+	var command *privateControlPendingCommand
+	deadline := time.After(time.Second)
+	for command == nil {
+		commands := client.pendingCommands()
+		if len(commands) == 1 {
+			command = commands[0]
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("revocation command was not queued")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	ackID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawAck, err := json.Marshal(privateControlAck{
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          "ack",
+		MessageID:     ackID,
+		InReplyTo:     command.message.MessageID,
+		Outcome:       "applied",
+		DenyUntil:     command.message.DenyUntil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot *privateControlSnapshotReassembly
+	if err := client.handleSessionMessage(rawAck, "MDEyMzQ1Njc4OTo7PD0-Pw", &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case completed := <-result:
+		if completed.err != nil || completed.id != command.message.MessageID || completed.ack.Outcome != "applied" {
+			t.Fatalf("revocation completion = %#v", completed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("revocation caller did not receive acknowledgement")
+	}
+}
+
+func TestPrivateControlClientRejectsAcknowledgementWithDifferentDenyUntil(t *testing.T) {
+	commandID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackID, err := newPrivateControlID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &privateControlClient{
+		state:         newManagementState(),
+		pending:       make(map[string]*privateControlPendingCommand),
+		commandNotify: make(chan struct{}, 1),
+	}
+	command := &privateControlPendingCommand{
+		message: privateControlRevokeServiceAdmission{
+			SchemaVersion: privateControlSchemaVersion,
+			Type:          "revoke_service_admission",
+			MessageID:     commandID,
+			ChannelID:     100,
+			ServiceID:     "recorder-01",
+			Reason:        "service_disabled",
+			DenyUntil:     time.Now().Add(time.Minute).Unix(),
+		},
+		result: make(chan privateControlCommandResult, 1),
+	}
+	if err := client.enqueuePendingCommand(command); err != nil {
+		t.Fatal(err)
+	}
+	rawAck, err := json.Marshal(privateControlAck{
+		SchemaVersion: privateControlSchemaVersion,
+		Type:          "ack",
+		MessageID:     ackID,
+		InReplyTo:     commandID,
+		Outcome:       "applied",
+		DenyUntil:     command.message.DenyUntil + 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshot *privateControlSnapshotReassembly
+	if err := client.handleSessionMessage(rawAck, "MDEyMzQ1Njc4OTo7PD0-Pw", &snapshot); err == nil {
+		t.Fatal("mismatched acknowledgement deadline was accepted")
+	}
+	if commands := client.pendingCommands(); len(commands) != 1 || commands[0].message.MessageID != commandID {
+		t.Fatalf("pending commands after mismatched acknowledgement = %#v", commands)
+	}
+}
 
 func TestPrivateControlIDRequiresCanonicalBase64URL(t *testing.T) {
 	id, err := newPrivateControlID()

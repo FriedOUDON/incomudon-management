@@ -131,7 +131,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid Private Control Link configuration: %v", err)
 	}
-	api, err := newManagementAPI(apiConfig, state)
+	api, err := newManagementAPI(apiConfig, state, client)
 	if err != nil {
 		log.Fatalf("invalid Management API configuration: %v", err)
 	}
@@ -211,6 +211,11 @@ func loadConfiguration() (privateControlClientConfig, string, managementAPIConfi
 	apiServicesFile := flag.String("api-services-file", os.Getenv("INCOMUDON_MANAGEMENT_API_SERVICES_FILE"), "management-services.csv path")
 	apiChannelACLFile := flag.String("api-channel-acl-file", os.Getenv("INCOMUDON_MANAGEMENT_API_CHANNEL_ACL_FILE"), "management-channel-acl.csv path")
 	apiGlobalPermissionsFile := flag.String("api-global-permissions-file", os.Getenv("INCOMUDON_MANAGEMENT_API_GLOBAL_PERMISSIONS_FILE"), "management-global-permissions.csv path")
+	grantSigningKeyFile := flag.String("grant-signing-key-file", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_SIGNING_KEY_FILE"), "Service Admission Ed25519 PKCS#8 private key PEM file")
+	grantKeyID := flag.String("grant-key-id", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_KEY_ID"), "Service Admission JWS key ID")
+	grantIssuer := flag.String("grant-issuer", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_ISSUER"), "Service Admission JWS issuer")
+	grantAudience := flag.String("grant-audience", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_AUDIENCE"), "Service Admission JWS Relay audience")
+	grantTTLSeconds := flag.String("grant-ttl-seconds", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_TTL_SECONDS"), "Service Admission grant lifetime in seconds (60..3600)")
 	flag.Parse()
 	return privateControlClientConfig{
 			transport:       *transport,
@@ -229,6 +234,11 @@ func loadConfiguration() (privateControlClientConfig, string, managementAPIConfi
 			servicesFile:          *apiServicesFile,
 			channelACLFile:        *apiChannelACLFile,
 			globalPermissionsFile: *apiGlobalPermissionsFile,
+			grantSigningKeyFile:   *grantSigningKeyFile,
+			grantKeyID:            *grantKeyID,
+			grantIssuer:           *grantIssuer,
+			grantAudience:         *grantAudience,
+			grantTTLSeconds:       *grantTTLSeconds,
 		}
 }
 

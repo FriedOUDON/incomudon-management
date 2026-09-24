@@ -18,16 +18,18 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
 
 const (
-	privateControlSchemaVersion    = "private-control-link-v1"
-	privateControlMaxFrameBytes    = 65536
-	privateControlTLSMinVersion    = tls.VersionTLS13
-	privateControlTransportMTLSTCP = "mtls-tcp"
-	privateControlTransportUDS     = "uds"
+	privateControlSchemaVersion      = "private-control-link-v1"
+	privateControlMaxFrameBytes      = 65536
+	privateControlTLSMinVersion      = tls.VersionTLS13
+	privateControlTransportMTLSTCP   = "mtls-tcp"
+	privateControlTransportUDS       = "uds"
+	privateControlMaxPendingCommands = 64
 )
 
 var (
@@ -69,6 +71,20 @@ type privateControlClient struct {
 	config    privateControlClientConfig
 	tlsConfig *tls.Config
 	state     *managementState
+
+	commandMu     sync.Mutex
+	pending       map[string]*privateControlPendingCommand
+	commandNotify chan struct{}
+}
+
+type privateControlPendingCommand struct {
+	message privateControlRevokeServiceAdmission
+	result  chan privateControlCommandResult
+}
+
+type privateControlCommandResult struct {
+	ack privateControlAck
+	err error
 }
 
 type privateControlHello struct {
@@ -140,6 +156,28 @@ type privateControlError struct {
 	Code          string `json:"code"`
 }
 
+type privateControlRevokeServiceAdmission struct {
+	SchemaVersion string `json:"schema_version"`
+	Type          string `json:"type"`
+	MessageID     string `json:"message_id"`
+	ChannelID     uint32 `json:"channel_id"`
+	ServiceID     string `json:"service_id,omitempty"`
+	GrantIDHash   string `json:"grant_id_hash,omitempty"`
+	Reason        string `json:"reason"`
+	DenyUntil     int64  `json:"deny_until"`
+}
+
+type privateControlAck struct {
+	SchemaVersion           string `json:"schema_version"`
+	Type                    string `json:"type"`
+	MessageID               string `json:"message_id"`
+	InReplyTo               string `json:"in_reply_to"`
+	Outcome                 string `json:"outcome"`
+	DenyUntil               int64  `json:"deny_until"`
+	AffectedMembershipCount uint32 `json:"affected_membership_count"`
+	TalkReleaseCount        uint32 `json:"talk_release_count"`
+}
+
 type privateControlLifecycleEvent struct {
 	SchemaVersion  string  `json:"schema_version"`
 	Type           string  `json:"type"`
@@ -158,7 +196,12 @@ func newPrivateControlClient(config privateControlClientConfig, state *managemen
 	if state == nil || !validManagementServiceID(config.serviceID) {
 		return nil, errors.New("Management Service ID is required")
 	}
-	client := &privateControlClient{config: config, state: state}
+	client := &privateControlClient{
+		config:        config,
+		state:         state,
+		pending:       make(map[string]*privateControlPendingCommand),
+		commandNotify: make(chan struct{}, 1),
+	}
 	switch config.transport {
 	case privateControlTransportMTLSTCP:
 		if strings.TrimSpace(config.relayAddress) == "" || strings.TrimSpace(config.serverName) == "" ||
@@ -294,55 +337,208 @@ func (c *privateControlClient) runSession(context context.Context) error {
 	}); err != nil {
 		return err
 	}
+	incoming := make(chan privateControlReadResult, 1)
+	readerDone := make(chan struct{})
+	defer close(readerDone)
+	go c.readSessionFrames(connection, incoming, readerDone)
 	var snapshot *privateControlSnapshotReassembly
+	sentCommands := make(map[string]struct{})
 
 	for {
-		rawMessage, err := readPrivateControlFrame(connection)
-		if err != nil {
+		if err := c.sendPendingCommands(connection, sentCommands); err != nil {
 			return err
 		}
-		envelope, err := decodePrivateControlEnvelope(rawMessage)
-		if err != nil {
-			return err
-		}
-		switch envelope.Type {
-		case "relay_lifecycle_event":
-			var event privateControlLifecycleEvent
-			if err := decodePrivateControlJSON(rawMessage, &event); err != nil {
+		select {
+		case <-context.Done():
+			return context.Err()
+		case <-c.commandNotify:
+			continue
+		case result := <-incoming:
+			if result.err != nil {
+				return result.err
+			}
+			if err := c.handleSessionMessage(result.raw, snapshotRequestID, &snapshot); err != nil {
 				return err
 			}
-			if !validPrivateControlLifecycleEvent(rawMessage, event) {
-				return errors.New("invalid Relay lifecycle event")
-			}
-			c.state.recordLifecycleEvent(event)
-		case "relay_state_snapshot":
-			var response privateControlRelayStateSnapshot
-			if err := decodePrivateControlJSON(rawMessage, &response); err != nil || !validPrivateControlRelayStateSnapshot(response) || response.InReplyTo != snapshotRequestID {
-				return errors.New("invalid Relay state snapshot")
-			}
-			if snapshot == nil {
-				snapshot = &privateControlSnapshotReassembly{snapshotID: response.SnapshotID, chunkCount: response.ChunkCount, chunks: make(map[uint16][]privateControlSnapshotChannel)}
-			}
-			complete, channels, err := snapshot.add(response)
-			if err != nil {
-				return err
-			}
-			if complete {
-				c.state.applyRelayStateSnapshot(channels)
-			}
-		case "error":
-			var response privateControlError
-			if err := decodePrivateControlJSON(rawMessage, &response); err != nil {
-				return err
-			}
-			if !validPrivateControlError(response) {
-				return errors.New("invalid Private Control Link error")
-			}
-			return fmt.Errorf("Relay Private Control Link error: %s", response.Code)
-		default:
-			return fmt.Errorf("unexpected Relay Private Control Link message type %q", envelope.Type)
 		}
 	}
+}
+
+type privateControlReadResult struct {
+	raw []byte
+	err error
+}
+
+func (c *privateControlClient) readSessionFrames(connection net.Conn, incoming chan<- privateControlReadResult, done <-chan struct{}) {
+	for {
+		raw, err := readPrivateControlFrame(connection)
+		result := privateControlReadResult{raw: raw, err: err}
+		select {
+		case incoming <- result:
+		case <-done:
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (c *privateControlClient) handleSessionMessage(rawMessage []byte, snapshotRequestID string, snapshot **privateControlSnapshotReassembly) error {
+	envelope, err := decodePrivateControlEnvelope(rawMessage)
+	if err != nil {
+		return err
+	}
+	switch envelope.Type {
+	case "relay_lifecycle_event":
+		var event privateControlLifecycleEvent
+		if err := decodePrivateControlJSON(rawMessage, &event); err != nil {
+			return err
+		}
+		if !validPrivateControlLifecycleEvent(rawMessage, event) {
+			return errors.New("invalid Relay lifecycle event")
+		}
+		c.state.recordLifecycleEvent(event)
+	case "relay_state_snapshot":
+		var response privateControlRelayStateSnapshot
+		if err := decodePrivateControlJSON(rawMessage, &response); err != nil || !validPrivateControlRelayStateSnapshot(response) || response.InReplyTo != snapshotRequestID {
+			return errors.New("invalid Relay state snapshot")
+		}
+		if *snapshot == nil {
+			*snapshot = &privateControlSnapshotReassembly{snapshotID: response.SnapshotID, chunkCount: response.ChunkCount, chunks: make(map[uint16][]privateControlSnapshotChannel)}
+		}
+		complete, channels, err := (*snapshot).add(response)
+		if err != nil {
+			return err
+		}
+		if complete {
+			c.state.applyRelayStateSnapshot(channels)
+		}
+	case "ack":
+		var response privateControlAck
+		if err := decodePrivateControlJSON(rawMessage, &response); err != nil || !validPrivateControlAck(response) || !c.completePendingAcknowledgement(response) {
+			return errors.New("invalid or unexpected Private Control Link acknowledgement")
+		}
+	case "error":
+		var response privateControlError
+		if err := decodePrivateControlJSON(rawMessage, &response); err != nil {
+			return err
+		}
+		if !validPrivateControlError(response) {
+			return errors.New("invalid Private Control Link error")
+		}
+		if response.InReplyTo == snapshotRequestID {
+			return fmt.Errorf("Relay Private Control Link error: %s", response.Code)
+		}
+		if response.InReplyTo != "" && c.completePendingCommand(response.InReplyTo, privateControlCommandResult{err: fmt.Errorf("Relay Private Control Link error: %s", response.Code)}) {
+			return nil
+		}
+		return fmt.Errorf("unexpected Relay Private Control Link error: %s", response.Code)
+	default:
+		return fmt.Errorf("unexpected Relay Private Control Link message type %q", envelope.Type)
+	}
+	return nil
+}
+
+func (c *privateControlClient) sendPendingCommands(connection net.Conn, sent map[string]struct{}) error {
+	now := time.Now().Unix()
+	for _, command := range c.pendingCommands() {
+		if _, alreadySent := sent[command.message.MessageID]; alreadySent {
+			continue
+		}
+		if command.message.DenyUntil <= now {
+			c.completePendingCommand(command.message.MessageID, privateControlCommandResult{err: errors.New("Service Admission revocation deadline elapsed before Relay acknowledgement")})
+			continue
+		}
+		if err := writePrivateControlFrame(connection, command.message); err != nil {
+			return err
+		}
+		sent[command.message.MessageID] = struct{}{}
+	}
+	return nil
+}
+
+func (c *privateControlClient) revokeServiceAdmission(context context.Context, request managementServiceAdmissionRevocationRequest) (privateControlAck, string, error) {
+	messageID, err := newPrivateControlID()
+	if err != nil {
+		return privateControlAck{}, "", err
+	}
+	command := &privateControlPendingCommand{
+		message: privateControlRevokeServiceAdmission{
+			SchemaVersion: privateControlSchemaVersion,
+			Type:          "revoke_service_admission",
+			MessageID:     messageID,
+			ChannelID:     request.ChannelID,
+			ServiceID:     request.ServiceID,
+			GrantIDHash:   request.GrantIDHash,
+			Reason:        request.Reason,
+			DenyUntil:     request.DenyUntil,
+		},
+		result: make(chan privateControlCommandResult, 1),
+	}
+	if !validPrivateControlRevocation(command.message) {
+		return privateControlAck{}, "", errors.New("invalid Service Admission revocation command")
+	}
+	if err := c.enqueuePendingCommand(command); err != nil {
+		return privateControlAck{}, "", err
+	}
+	select {
+	case result := <-command.result:
+		return result.ack, messageID, result.err
+	case <-context.Done():
+		return privateControlAck{}, messageID, context.Err()
+	}
+}
+
+func (c *privateControlClient) enqueuePendingCommand(command *privateControlPendingCommand) error {
+	c.commandMu.Lock()
+	defer c.commandMu.Unlock()
+	if len(c.pending) >= privateControlMaxPendingCommands {
+		return errors.New("Private Control Link command queue is full")
+	}
+	c.pending[command.message.MessageID] = command
+	select {
+	case c.commandNotify <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (c *privateControlClient) pendingCommands() []*privateControlPendingCommand {
+	c.commandMu.Lock()
+	defer c.commandMu.Unlock()
+	commands := make([]*privateControlPendingCommand, 0, len(c.pending))
+	for _, command := range c.pending {
+		commands = append(commands, command)
+	}
+	return commands
+}
+
+func (c *privateControlClient) completePendingCommand(messageID string, result privateControlCommandResult) bool {
+	c.commandMu.Lock()
+	command, found := c.pending[messageID]
+	if found {
+		delete(c.pending, messageID)
+	}
+	c.commandMu.Unlock()
+	if !found {
+		return false
+	}
+	command.result <- result
+	return true
+}
+
+func (c *privateControlClient) completePendingAcknowledgement(response privateControlAck) bool {
+	c.commandMu.Lock()
+	command, found := c.pending[response.InReplyTo]
+	if found && command.message.DenyUntil == response.DenyUntil {
+		delete(c.pending, response.InReplyTo)
+	}
+	c.commandMu.Unlock()
+	if !found || command.message.DenyUntil != response.DenyUntil {
+		return false
+	}
+	command.result <- privateControlCommandResult{ack: response}
+	return true
 }
 
 func validManagementServiceID(value string) bool {
@@ -439,6 +635,34 @@ func validPrivateControlError(response privateControlError) bool {
 	}
 	_, ok := privateControlErrorCodes[response.Code]
 	return ok
+}
+
+func validPrivateControlGrantIDHash(value string) bool {
+	decoded, err := base64.RawURLEncoding.DecodeString(value)
+	return err == nil && len(decoded) == 32 && base64.RawURLEncoding.EncodeToString(decoded) == value
+}
+
+func validPrivateControlRevocation(message privateControlRevokeServiceAdmission) bool {
+	return message.SchemaVersion == privateControlSchemaVersion && message.Type == "revoke_service_admission" &&
+		validPrivateControlID(message.MessageID) && message.DenyUntil >= 1 &&
+		(message.ServiceID == "" || validManagementServiceID(message.ServiceID)) &&
+		(message.GrantIDHash == "" || validPrivateControlGrantIDHash(message.GrantIDHash)) &&
+		(message.ServiceID != "" || message.GrantIDHash != "") && validServiceAdmissionRevocationReason(message.Reason)
+}
+
+func validPrivateControlAck(response privateControlAck) bool {
+	if response.SchemaVersion != privateControlSchemaVersion || response.Type != "ack" ||
+		!validPrivateControlID(response.MessageID) || !validPrivateControlID(response.InReplyTo) || response.DenyUntil < 1 {
+		return false
+	}
+	switch response.Outcome {
+	case "applied":
+		return true
+	case "already_expired":
+		return response.AffectedMembershipCount == 0 && response.TalkReleaseCount == 0
+	default:
+		return false
+	}
 }
 
 func validPrivateControlRelayStateSnapshot(snapshot privateControlRelayStateSnapshot) bool {

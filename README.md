@@ -8,19 +8,23 @@ redacted lifecycle events.
 
 The service consumes redacted Private Control Link lifecycle events and obtains
 a current Relay state snapshot after every authenticated connection. The
-following non-durable, read-only Management Plane v1 resources are implemented:
+following Management Plane v1 resources are implemented:
 
 - `GET /v1/health` requires the explicit global `health.read` permission.
 - `GET /v1/channels` returns only channels within the caller's `viewer` scope.
 - `GET /v1/channels/{channel_id}/participants` requires `viewer` scope for the
   requested channel.
+- `POST /v1/service-admission-grants` issues a short-lived, self-service
+  Ed25519-signed grant from the authenticated caller's exact channel ACL.
+- `POST /v1/service-admission-revocations` requires the `admin` API role and
+  explicit global `service_admission.revoke` permission. `200` means the Relay
+  acknowledged the PCL command; `202` means it remains queued pending that ACK.
 
 The API never serves a prior connection's state after reconnecting: it returns
 `503 Service Unavailable` for state resources until a fresh complete PCL
 snapshot has been applied. It does not implement SSE delivery, Audit Retrieval,
-recording orchestration, Service Admission grant issuance, or revocation yet.
-Those capabilities remain separate increments so the Relay's live media path
-never depends on durable management storage.
+or recording orchestration. Those capabilities remain separate increments so
+the Relay's live media path never depends on durable management storage.
 
 `GET /healthz` and `GET /readyz` remain local process probes. `readyz` returns
 200 only after an authenticated PCL session has applied a current snapshot.
@@ -42,19 +46,41 @@ all of the following configuration values:
   `management-channel-acl.csv`, which supplies exact channel scopes.
 - `INCOMUDON_MANAGEMENT_API_GLOBAL_PERMISSIONS_FILE`: canonical
   `management-global-permissions.csv`, which grants explicit global
-  permissions. Version 1 currently defines only `health.read`.
+  permissions. Version 1 defines `health.read` and `service_admission.revoke`.
 
 `management-global-permissions.csv` uses this format:
 
 ```csv
 service_id,permission,enabled
 health-monitor-01,health.read,true
+management-admin,service_admission.revoke,true
 ```
 
 The API rejects a trusted certificate that is absent from the services CSV or
 mapped to a disabled service. A channel-scoped role never implies
 `health.read`. Mount all CSV ACL files and the client CA read-only; protect the
 server private key with the same or stricter access controls.
+
+## Service Admission signing
+
+Grant issuance is disabled unless all of the following values are configured:
+
+- `INCOMUDON_MANAGEMENT_GRANT_SIGNING_KEY_FILE`: one unencrypted Ed25519
+  PKCS#8 `PRIVATE KEY` PEM block, mounted read-only.
+- `INCOMUDON_MANAGEMENT_GRANT_KEY_ID`: the published Service Admission signing
+  key ID.
+- `INCOMUDON_MANAGEMENT_GRANT_ISSUER`: the configured JWS `iss` value.
+- `INCOMUDON_MANAGEMENT_GRANT_AUDIENCE`: the Relay's configured JWS `aud`
+  value.
+- `INCOMUDON_MANAGEMENT_GRANT_TTL_SECONDS`: optional lifetime from `60` through
+  `3600`; the default is `300`.
+
+The API derives `svc` from the authenticated Management API client. It derives
+the channel, sender, role, permissions, and interrupt priority solely from the
+matching `management-channel-acl.csv` row. It never returns the signing key or
+logs a compact grant. It retains a bounded in-memory index of unexpired grants
+for grant-specific revocation; use a service-scoped revocation after a
+Management Service restart or when grant history is unavailable.
 
 ## Private Control Link transport
 

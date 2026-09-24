@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -20,6 +21,7 @@ import (
 const (
 	managementAPIVersionPrefix     = "/v1"
 	managementAPIHealthPermission  = "health.read"
+	managementAPIRevokePermission  = "service_admission.revoke"
 	managementAPIEventDeliveryMode = "disabled"
 	managementAPIAuditRetrieval    = false
 	managementAPIMinimumTLSVersion = tls.VersionTLS13
@@ -31,6 +33,7 @@ var (
 	managementAPIPermissionPattern      = regexp.MustCompile(`^[a-z][a-z0-9._-]{0,63}$`)
 	managementAPIKnownGlobalPermissions = map[string]struct{}{
 		managementAPIHealthPermission: {},
+		managementAPIRevokePermission: {},
 	}
 )
 
@@ -42,6 +45,11 @@ type managementAPIConfig struct {
 	servicesFile          string
 	channelACLFile        string
 	globalPermissionsFile string
+	grantSigningKeyFile   string
+	grantKeyID            string
+	grantIssuer           string
+	grantAudience         string
+	grantTTLSeconds       string
 }
 
 func (c managementAPIConfig) enabled() bool {
@@ -53,7 +61,22 @@ type managementAPIService struct {
 	apiRole           string
 	enabled           bool
 	channels          map[uint32]struct{}
+	admissions        map[managementAdmissionKey]managementAdmissionACL
 	globalPermissions map[string]struct{}
+}
+
+type managementAdmissionKey struct {
+	channelID uint32
+	senderID  uint32
+}
+
+type managementAdmissionACL struct {
+	role              string
+	allowListen       bool
+	allowTalk         bool
+	allowInterrupt    bool
+	interruptPriority uint8
+	enabled           bool
 }
 
 type managementAPIAuthorizer struct {
@@ -63,8 +86,14 @@ type managementAPIAuthorizer struct {
 type managementAPI struct {
 	state      *managementState
 	authorizer managementAPIAuthorizer
+	issuer     *serviceAdmissionGrantIssuer
+	revoker    managementServiceAdmissionRevoker
 	tlsConfig  *tls.Config
 	listen     string
+}
+
+type managementServiceAdmissionRevoker interface {
+	revokeServiceAdmission(context.Context, managementServiceAdmissionRevocationRequest) (privateControlAck, string, error)
 }
 
 type managementCapabilities struct {
@@ -96,7 +125,7 @@ type managementParticipantListResponse struct {
 	Participants []managementParticipant `json:"participants"`
 }
 
-func newManagementAPI(config managementAPIConfig, state *managementState) (*managementAPI, error) {
+func newManagementAPI(config managementAPIConfig, state *managementState, revoker managementServiceAdmissionRevoker) (*managementAPI, error) {
 	if !config.enabled() {
 		return nil, nil
 	}
@@ -131,9 +160,15 @@ func newManagementAPI(config managementAPIConfig, state *managementState) (*mana
 	if err != nil {
 		return nil, err
 	}
+	issuer, err := loadServiceAdmissionGrantIssuer(config)
+	if err != nil {
+		return nil, err
+	}
 	return &managementAPI{
 		state:      state,
 		authorizer: authorizer,
+		issuer:     issuer,
+		revoker:    revoker,
 		listen:     config.listen,
 		tlsConfig: &tls.Config{
 			MinVersion:   managementAPIMinimumTLSVersion,
@@ -186,6 +221,7 @@ func loadManagementAPIAuthorizer(servicesFile, channelACLFile, globalPermissions
 			apiRole:           role,
 			enabled:           enabled,
 			channels:          make(map[uint32]struct{}),
+			admissions:        make(map[managementAdmissionKey]managementAdmissionACL),
 			globalPermissions: make(map[string]struct{}),
 		}
 		byService[serviceID] = service
@@ -252,6 +288,14 @@ func loadManagementAPIAuthorizer(servicesFile, channelACLFile, globalPermissions
 		seenACL[tuple] = struct{}{}
 		if enabled {
 			service.channels[channelID] = struct{}{}
+			service.admissions[managementAdmissionKey{channelID: channelID, senderID: senderID}] = managementAdmissionACL{
+				role:              row[3],
+				allowListen:       allowListen,
+				allowTalk:         allowTalk,
+				allowInterrupt:    allowInterrupt,
+				interruptPriority: uint8(priority),
+				enabled:           true,
+			}
 		}
 	}
 
@@ -381,6 +425,14 @@ func (s *managementAPIService) hasGlobalPermission(permission string) bool {
 	return found
 }
 
+func (s *managementAPIService) admissionACL(channelID, senderID uint32) (managementAdmissionACL, bool) {
+	if s == nil {
+		return managementAdmissionACL{}, false
+	}
+	acl, found := s.admissions[managementAdmissionKey{channelID: channelID, senderID: senderID}]
+	return acl, found && acl.enabled
+}
+
 func (a *managementAPI) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	service, ok := a.authenticate(writer, request)
 	if !ok {
@@ -388,13 +440,29 @@ func (a *managementAPI) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 	}
 	switch request.URL.Path {
 	case managementAPIVersionPrefix + "/health":
+		if request.Method != http.MethodGet {
+			writeManagementAPIMethodNotAllowed(writer, http.MethodGet)
+			return
+		}
 		a.handleHealth(writer, service)
 	case managementAPIVersionPrefix + "/channels":
+		if request.Method != http.MethodGet {
+			writeManagementAPIMethodNotAllowed(writer, http.MethodGet)
+			return
+		}
 		a.handleChannels(writer, service)
+	case managementAPIVersionPrefix + "/service-admission-grants":
+		a.handleServiceAdmissionGrant(writer, request, service)
+	case managementAPIVersionPrefix + "/service-admission-revocations":
+		a.handleServiceAdmissionRevocation(writer, request, service)
 	default:
 		channelID, matched := managementAPIChannelIDFromPath(request.URL.Path)
 		if !matched {
 			writeManagementAPIError(writer, http.StatusNotFound)
+			return
+		}
+		if request.Method != http.MethodGet {
+			writeManagementAPIMethodNotAllowed(writer, http.MethodGet)
 			return
 		}
 		a.handleParticipants(writer, service, channelID)
@@ -402,17 +470,17 @@ func (a *managementAPI) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 }
 
 func (a *managementAPI) authenticate(writer http.ResponseWriter, request *http.Request) (*managementAPIService, bool) {
-	if request.Method != http.MethodGet {
-		writer.Header().Set("Allow", http.MethodGet)
-		writeManagementAPIError(writer, http.StatusMethodNotAllowed)
-		return nil, false
-	}
 	service, found := a.authorizer.serviceForRequest(request)
 	if !found {
 		writeManagementAPIError(writer, http.StatusForbidden)
 		return nil, false
 	}
 	return service, true
+}
+
+func writeManagementAPIMethodNotAllowed(writer http.ResponseWriter, method string) {
+	writer.Header().Set("Allow", method)
+	writeManagementAPIError(writer, http.StatusMethodNotAllowed)
 }
 
 func (a *managementAPI) handleHealth(writer http.ResponseWriter, service *managementAPIService) {
