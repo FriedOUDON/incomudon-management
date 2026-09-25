@@ -19,12 +19,13 @@ import (
 )
 
 const (
-	managementAPIVersionPrefix     = "/v1"
-	managementAPIHealthPermission  = "health.read"
-	managementAPIRevokePermission  = "service_admission.revoke"
-	managementAPIEventDeliveryMode = "disabled"
-	managementAPIAuditRetrieval    = false
-	managementAPIMinimumTLSVersion = tls.VersionTLS13
+	managementAPIVersionPrefix         = "/v1"
+	managementAPIHealthPermission      = "health.read"
+	managementAPIRevokePermission      = "service_admission.revoke"
+	managementAPIEventDeliveryDisabled = "disabled"
+	managementAPIEventDeliveryLive     = "live"
+	managementAPIAuditRetrieval        = false
+	managementAPIMinimumTLSVersion     = tls.VersionTLS13
 )
 
 var (
@@ -50,6 +51,7 @@ type managementAPIConfig struct {
 	grantIssuer           string
 	grantAudience         string
 	grantTTLSeconds       string
+	eventDelivery         string
 }
 
 func (c managementAPIConfig) enabled() bool {
@@ -84,12 +86,14 @@ type managementAPIAuthorizer struct {
 }
 
 type managementAPI struct {
-	state      *managementState
-	authorizer managementAPIAuthorizer
-	issuer     *serviceAdmissionGrantIssuer
-	revoker    managementServiceAdmissionRevoker
-	tlsConfig  *tls.Config
-	listen     string
+	state         *managementState
+	authorizer    managementAPIAuthorizer
+	issuer        *serviceAdmissionGrantIssuer
+	revoker       managementServiceAdmissionRevoker
+	liveEvents    *managementLiveEventHub
+	eventDelivery string
+	tlsConfig     *tls.Config
+	listen        string
 }
 
 type managementServiceAdmissionRevoker interface {
@@ -164,12 +168,26 @@ func newManagementAPI(config managementAPIConfig, state *managementState, revoke
 	if err != nil {
 		return nil, err
 	}
+	eventDelivery := strings.TrimSpace(config.eventDelivery)
+	if eventDelivery == "" {
+		eventDelivery = managementAPIEventDeliveryDisabled
+	}
+	if eventDelivery != managementAPIEventDeliveryDisabled && eventDelivery != managementAPIEventDeliveryLive {
+		return nil, fmt.Errorf("Management API event delivery must be %q or %q", managementAPIEventDeliveryDisabled, managementAPIEventDeliveryLive)
+	}
+	var liveEvents *managementLiveEventHub
+	if eventDelivery == managementAPIEventDeliveryLive {
+		liveEvents = newManagementLiveEventHub()
+	}
+	state.setLiveEvents(liveEvents)
 	return &managementAPI{
-		state:      state,
-		authorizer: authorizer,
-		issuer:     issuer,
-		revoker:    revoker,
-		listen:     config.listen,
+		state:         state,
+		authorizer:    authorizer,
+		issuer:        issuer,
+		revoker:       revoker,
+		liveEvents:    liveEvents,
+		eventDelivery: eventDelivery,
+		listen:        config.listen,
 		tlsConfig: &tls.Config{
 			MinVersion:   managementAPIMinimumTLSVersion,
 			Certificates: []tls.Certificate{certificate},
@@ -420,6 +438,34 @@ func (s *managementAPIService) canReadChannel(channelID uint32) bool {
 	return found
 }
 
+func (s *managementAPIService) canReadEventChannel(channelID uint32) bool {
+	if s == nil || (s.apiRole != "viewer" && s.apiRole != "recorder" && s.apiRole != "operator" && s.apiRole != "auditor") {
+		return false
+	}
+	_, found := s.channels[channelID]
+	return found
+}
+
+func (s *managementAPIService) canOpenEventStream() bool {
+	if s == nil {
+		return false
+	}
+	if s.hasGlobalPermission(managementAPIHealthPermission) {
+		return true
+	}
+	if s.apiRole != "viewer" && s.apiRole != "recorder" && s.apiRole != "operator" && s.apiRole != "auditor" {
+		return false
+	}
+	return len(s.channels) > 0
+}
+
+func (s *managementAPIService) canReceiveEvent(event managementEvent) bool {
+	if event.ChannelID != nil {
+		return s.canReadEventChannel(*event.ChannelID)
+	}
+	return event.Type == "relay_health_changed" && s.hasGlobalPermission(managementAPIHealthPermission)
+}
+
 func (s *managementAPIService) hasGlobalPermission(permission string) bool {
 	_, found := s.globalPermissions[permission]
 	return found
@@ -451,6 +497,8 @@ func (a *managementAPI) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 			return
 		}
 		a.handleChannels(writer, service)
+	case managementAPIVersionPrefix + "/events":
+		a.handleEvents(writer, request, service)
 	case managementAPIVersionPrefix + "/service-admission-grants":
 		a.handleServiceAdmissionGrant(writer, request, service)
 	case managementAPIVersionPrefix + "/service-admission-revocations":
@@ -491,10 +539,17 @@ func (a *managementAPI) handleHealth(writer http.ResponseWriter, service *manage
 	writeJSON(writer, http.StatusOK, managementHealthResponse{
 		Status: a.state.managementAPIHealthStatus(),
 		Capabilities: managementCapabilities{
-			EventDelivery:  managementAPIEventDeliveryMode,
+			EventDelivery:  a.eventDeliveryMode(),
 			AuditRetrieval: managementAPIAuditRetrieval,
 		},
 	})
+}
+
+func (a *managementAPI) eventDeliveryMode() string {
+	if a == nil || a.eventDelivery == "" {
+		return managementAPIEventDeliveryDisabled
+	}
+	return a.eventDelivery
 }
 
 func (a *managementAPI) handleChannels(writer http.ResponseWriter, service *managementAPIService) {

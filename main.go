@@ -23,6 +23,7 @@ type managementState struct {
 	lastEventType string
 	channels      map[uint32]map[uint32]string
 	snapshotAt    time.Time
+	liveEvents    *managementLiveEventHub
 }
 
 func newManagementState() *managementState {
@@ -48,35 +49,44 @@ func (s *managementState) markDisconnected() {
 
 func (s *managementState) recordLifecycleEvent(event privateControlLifecycleEvent) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.lastEventAt = time.Now().UTC()
 	s.lastEventType = event.EventType
-	if event.ChannelID == nil || event.SenderID == nil {
-		return
-	}
-	if s.channels == nil {
-		s.channels = make(map[uint32]map[uint32]string)
-	}
-	participants := s.channels[*event.ChannelID]
-	if participants == nil {
-		participants = make(map[uint32]string)
-		s.channels[*event.ChannelID] = participants
-	}
-	switch event.EventType {
-	case "participant_joined":
-		participants[*event.SenderID] = "idle"
-	case "participant_left":
-		delete(participants, *event.SenderID)
-		if len(participants) == 0 {
-			delete(s.channels, *event.ChannelID)
+	if event.ChannelID != nil && event.SenderID != nil {
+		if s.channels == nil {
+			s.channels = make(map[uint32]map[uint32]string)
 		}
-	case "talk_started":
-		participants[*event.SenderID] = "talking"
-	case "talk_ended":
-		if _, found := participants[*event.SenderID]; found {
+		participants := s.channels[*event.ChannelID]
+		if participants == nil {
+			participants = make(map[uint32]string)
+			s.channels[*event.ChannelID] = participants
+		}
+		switch event.EventType {
+		case "participant_joined":
 			participants[*event.SenderID] = "idle"
+		case "participant_left":
+			delete(participants, *event.SenderID)
+			if len(participants) == 0 {
+				delete(s.channels, *event.ChannelID)
+			}
+		case "talk_started":
+			participants[*event.SenderID] = "talking"
+		case "talk_ended":
+			if _, found := participants[*event.SenderID]; found {
+				participants[*event.SenderID] = "idle"
+			}
 		}
 	}
+	liveEvents := s.liveEvents
+	s.mu.Unlock()
+	if liveEvents != nil {
+		liveEvents.publish(event)
+	}
+}
+
+func (s *managementState) setLiveEvents(events *managementLiveEventHub) {
+	s.mu.Lock()
+	s.liveEvents = events
+	s.mu.Unlock()
 }
 
 func (s *managementState) applyRelayStateSnapshot(channels []privateControlSnapshotChannel) {
@@ -216,6 +226,7 @@ func loadConfiguration() (privateControlClientConfig, string, managementAPIConfi
 	grantIssuer := flag.String("grant-issuer", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_ISSUER"), "Service Admission JWS issuer")
 	grantAudience := flag.String("grant-audience", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_AUDIENCE"), "Service Admission JWS Relay audience")
 	grantTTLSeconds := flag.String("grant-ttl-seconds", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_TTL_SECONDS"), "Service Admission grant lifetime in seconds (60..3600)")
+	eventDelivery := flag.String("api-event-delivery", valueOrDefault(os.Getenv("INCOMUDON_MANAGEMENT_API_EVENT_DELIVERY"), managementAPIEventDeliveryDisabled), "Management SSE delivery: disabled or live")
 	flag.Parse()
 	return privateControlClientConfig{
 			transport:       *transport,
@@ -239,6 +250,7 @@ func loadConfiguration() (privateControlClientConfig, string, managementAPIConfi
 			grantIssuer:           *grantIssuer,
 			grantAudience:         *grantAudience,
 			grantTTLSeconds:       *grantTTLSeconds,
+			eventDelivery:         *eventDelivery,
 		}
 }
 

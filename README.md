@@ -14,6 +14,8 @@ following Management Plane v1 resources are implemented:
 - `GET /v1/channels` returns only channels within the caller's `viewer` scope.
 - `GET /v1/channels/{channel_id}/participants` requires `viewer` scope for the
   requested channel.
+- `GET /v1/events` provides non-durable live SSE when explicitly enabled. It
+  filters every event by the caller's channel role or global event permission.
 - `POST /v1/service-admission-grants` issues a short-lived, self-service
   Ed25519-signed grant from the authenticated caller's exact channel ACL.
 - `POST /v1/service-admission-revocations` requires the `admin` API role and
@@ -22,9 +24,13 @@ following Management Plane v1 resources are implemented:
 
 The API never serves a prior connection's state after reconnecting: it returns
 `503 Service Unavailable` for state resources until a fresh complete PCL
-snapshot has been applied. It does not implement SSE delivery, Audit Retrieval,
-or recording orchestration. Those capabilities remain separate increments so
-the Relay's live media path never depends on durable management storage.
+snapshot has been applied. Live SSE is not state replay: it begins after each
+new subscription, ignores `Last-Event-ID`, rejects any `since` parameter, and
+may lose events while a client is disconnected. Subscriber queues are bounded;
+a stalled subscriber is disconnected rather than delaying the PCL or Relay.
+The service does not implement replay SSE, Audit Retrieval, or recording
+orchestration. Those capabilities remain separate increments so the Relay's
+live media path never depends on durable management storage.
 
 `GET /healthz` and `GET /readyz` remain local process probes. `readyz` returns
 200 only after an authenticated PCL session has applied a current snapshot.
@@ -47,6 +53,9 @@ all of the following configuration values:
 - `INCOMUDON_MANAGEMENT_API_GLOBAL_PERMISSIONS_FILE`: canonical
   `management-global-permissions.csv`, which grants explicit global
   permissions. Version 1 defines `health.read` and `service_admission.revoke`.
+- `INCOMUDON_MANAGEMENT_API_EVENT_DELIVERY`: `disabled` (default) or `live`.
+  `live` enables non-durable `GET /v1/events`; replay is intentionally not
+  supported by this service.
 
 `management-global-permissions.csv` uses this format:
 
