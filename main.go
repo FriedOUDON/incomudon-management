@@ -24,6 +24,7 @@ type managementState struct {
 	channels      map[uint32]map[uint32]string
 	snapshotAt    time.Time
 	liveEvents    *managementLiveEventHub
+	recordingJobs *managementRecordingJobs
 }
 
 func newManagementState() *managementState {
@@ -77,10 +78,20 @@ func (s *managementState) recordLifecycleEvent(event privateControlLifecycleEven
 		}
 	}
 	liveEvents := s.liveEvents
+	recordingJobs := s.recordingJobs
 	s.mu.Unlock()
+	if recordingJobs != nil {
+		recordingJobs.applyLifecycleEvent(event)
+	}
 	if liveEvents != nil {
 		liveEvents.publish(event)
 	}
+}
+
+func (s *managementState) setRecordingJobs(jobs *managementRecordingJobs) {
+	s.mu.Lock()
+	s.recordingJobs = jobs
+	s.mu.Unlock()
 }
 
 func (s *managementState) setLiveEvents(events *managementLiveEventHub) {

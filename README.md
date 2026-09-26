@@ -30,9 +30,10 @@ snapshot has been applied. Live SSE is not state replay: it begins after each
 new subscription, ignores `Last-Event-ID`, rejects any `since` parameter, and
 may lose events while a client is disconnected. Subscriber queues are bounded;
 a stalled subscriber is disconnected rather than delaying the PCL or Relay.
-The service does not implement replay SSE, Audit Retrieval, or recording
-orchestration. Those capabilities remain separate increments so the Relay's
-live media path never depends on durable management storage.
+The service does not implement replay SSE or Audit Retrieval. It implements
+opaque, ACL-bound recording-job start/stop tracking; Recorder Workers remain
+separate receive-only Relay participants, and their credentials, media path,
+storage, and process supervision stay outside the Management API.
 
 `GET /healthz` and `GET /readyz` remain local process probes. `readyz` returns
 200 only after an authenticated PCL session has applied a current snapshot.

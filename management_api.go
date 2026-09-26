@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -98,6 +99,7 @@ type managementAPI struct {
 	aclReloadInterval     time.Duration
 	issuer                *serviceAdmissionGrantIssuer
 	revoker               managementServiceAdmissionRevoker
+	recordingJobs         *managementRecordingJobs
 	liveEvents            *managementLiveEventHub
 	eventDelivery         string
 	tlsConfig             *tls.Config
@@ -192,6 +194,8 @@ func newManagementAPI(config managementAPIConfig, state *managementState, revoke
 		liveEvents = newManagementLiveEventHub()
 	}
 	state.setLiveEvents(liveEvents)
+	recordingJobs := newManagementRecordingJobs()
+	state.setRecordingJobs(recordingJobs)
 	return &managementAPI{
 		state:                 state,
 		authorizer:            authorizer,
@@ -201,6 +205,7 @@ func newManagementAPI(config managementAPIConfig, state *managementState, revoke
 		aclReloadInterval:     aclReloadInterval,
 		issuer:                issuer,
 		revoker:               revoker,
+		recordingJobs:         recordingJobs,
 		liveEvents:            liveEvents,
 		eventDelivery:         eventDelivery,
 		listen:                config.listen,
@@ -519,7 +524,13 @@ func (a *managementAPI) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		a.handleServiceAdmissionGrant(writer, request, service)
 	case managementAPIVersionPrefix + "/service-admission-revocations":
 		a.handleServiceAdmissionRevocation(writer, request, service)
+	case managementAPIVersionPrefix + "/recording-jobs":
+		a.handleRecordingJobStart(writer, request, service)
 	default:
+		if jobID, matched := managementAPIRecordingJobIDFromStopPath(request.URL.Path); matched {
+			a.handleRecordingJobStop(writer, request, service, jobID)
+			return
+		}
 		channelID, matched := managementAPIChannelIDFromPath(request.URL.Path)
 		if !matched {
 			writeManagementAPIError(writer, http.StatusNotFound)
@@ -531,6 +542,19 @@ func (a *managementAPI) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 		}
 		a.handleParticipants(writer, service, channelID)
 	}
+}
+
+func managementAPIRecordingJobIDFromStopPath(path string) (string, bool) {
+	const prefix = managementAPIVersionPrefix + "/recording-jobs/"
+	const suffix = "/stop"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	jobID := strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix)
+	if strings.Contains(jobID, "/") || utf8.RuneCountInString(jobID) == 0 || utf8.RuneCountInString(jobID) > 128 {
+		return "", false
+	}
+	return jobID, true
 }
 
 func (a *managementAPI) authenticate(writer http.ResponseWriter, request *http.Request) (*managementAPIService, bool) {
