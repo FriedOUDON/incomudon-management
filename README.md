@@ -165,3 +165,9 @@ go run . \
   -pcl-relay-ca-file ./management-pcl/relay-ca.crt \
   -pcl-command-store-file ./var/pcl-revocations.json
 ```
+
+## License
+
+The Management Service source is licensed under the [MIT License](LICENSE). Third-party
+license texts and distribution notes are in
+[`THIRD_PARTY_LICENSES/`](THIRD_PARTY_LICENSES/).
