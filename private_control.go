@@ -57,14 +57,15 @@ var (
 )
 
 type privateControlClientConfig struct {
-	transport       string
-	relayAddress    string
-	udsSocketPath   string
-	serverName      string
-	serviceID       string
-	certificateFile string
-	privateKeyFile  string
-	relayCAFile     string
+	transport        string
+	relayAddress     string
+	udsSocketPath    string
+	serverName       string
+	serviceID        string
+	certificateFile  string
+	privateKeyFile   string
+	relayCAFile      string
+	commandStoreFile string
 }
 
 type privateControlClient struct {
@@ -74,6 +75,7 @@ type privateControlClient struct {
 
 	commandMu     sync.Mutex
 	pending       map[string]*privateControlPendingCommand
+	commandStore  *privateControlCommandStore
 	commandNotify chan struct{}
 }
 
@@ -196,10 +198,15 @@ func newPrivateControlClient(config privateControlClientConfig, state *managemen
 	if state == nil || !validManagementServiceID(config.serviceID) {
 		return nil, errors.New("Management Service ID is required")
 	}
+	commandStore, pending, err := openPrivateControlCommandStore(config.commandStoreFile, time.Now())
+	if err != nil {
+		return nil, err
+	}
 	client := &privateControlClient{
 		config:        config,
 		state:         state,
-		pending:       make(map[string]*privateControlPendingCommand),
+		pending:       pending,
+		commandStore:  commandStore,
 		commandNotify: make(chan struct{}, 1),
 	}
 	switch config.transport {
@@ -415,8 +422,15 @@ func (c *privateControlClient) handleSessionMessage(rawMessage []byte, snapshotR
 		}
 	case "ack":
 		var response privateControlAck
-		if err := decodePrivateControlJSON(rawMessage, &response); err != nil || !validPrivateControlAck(response) || !c.completePendingAcknowledgement(response) {
-			return errors.New("invalid or unexpected Private Control Link acknowledgement")
+		if err := decodePrivateControlJSON(rawMessage, &response); err != nil || !validPrivateControlAck(response) {
+			return errors.New("invalid Private Control Link acknowledgement")
+		}
+		completed, err := c.completePendingAcknowledgement(response)
+		if err != nil {
+			return err
+		}
+		if !completed {
+			return errors.New("unexpected Private Control Link acknowledgement")
 		}
 	case "error":
 		var response privateControlError
@@ -429,8 +443,14 @@ func (c *privateControlClient) handleSessionMessage(rawMessage []byte, snapshotR
 		if response.InReplyTo == snapshotRequestID {
 			return fmt.Errorf("Relay Private Control Link error: %s", response.Code)
 		}
-		if response.InReplyTo != "" && c.completePendingCommand(response.InReplyTo, privateControlCommandResult{err: fmt.Errorf("Relay Private Control Link error: %s", response.Code)}) {
-			return nil
+		if response.InReplyTo != "" {
+			completed, err := c.completePendingCommand(response.InReplyTo, privateControlCommandResult{err: fmt.Errorf("Relay Private Control Link error: %s", response.Code)})
+			if err != nil {
+				return err
+			}
+			if completed {
+				return nil
+			}
 		}
 		return fmt.Errorf("unexpected Relay Private Control Link error: %s", response.Code)
 	default:
@@ -446,7 +466,9 @@ func (c *privateControlClient) sendPendingCommands(connection net.Conn, sent map
 			continue
 		}
 		if command.message.DenyUntil <= now {
-			c.completePendingCommand(command.message.MessageID, privateControlCommandResult{err: errors.New("Service Admission revocation deadline elapsed before Relay acknowledgement")})
+			if _, err := c.completePendingCommand(command.message.MessageID, privateControlCommandResult{err: errors.New("Service Admission revocation deadline elapsed before Relay acknowledgement")}); err != nil {
+				return err
+			}
 			continue
 		}
 		if err := writePrivateControlFrame(connection, command.message); err != nil {
@@ -458,9 +480,48 @@ func (c *privateControlClient) sendPendingCommands(connection net.Conn, sent map
 }
 
 func (c *privateControlClient) revokeServiceAdmission(context context.Context, request managementServiceAdmissionRevocationRequest) (privateControlAck, string, error) {
-	messageID, err := newPrivateControlID()
+	command, err := c.newPendingRevocation(request)
 	if err != nil {
 		return privateControlAck{}, "", err
+	}
+	if err := c.enqueuePendingCommand(command); err != nil {
+		return privateControlAck{}, "", err
+	}
+	select {
+	case result := <-command.result:
+		return result.ack, command.message.MessageID, result.err
+	case <-context.Done():
+		return privateControlAck{}, command.message.MessageID, context.Err()
+	}
+}
+
+func (c *privateControlClient) queueServiceAdmissionRevocation(request managementServiceAdmissionRevocationRequest) (string, error) {
+	command, err := c.newPendingRevocation(request)
+	if err != nil {
+		return "", err
+	}
+	if err := c.enqueuePendingCommands([]*privateControlPendingCommand{command}); err != nil {
+		return "", err
+	}
+	return command.message.MessageID, nil
+}
+
+func (c *privateControlClient) queueServiceAdmissionRevocations(requests []managementServiceAdmissionRevocationRequest) error {
+	commands := make([]*privateControlPendingCommand, 0, len(requests))
+	for _, request := range requests {
+		command, err := c.newPendingRevocation(request)
+		if err != nil {
+			return err
+		}
+		commands = append(commands, command)
+	}
+	return c.enqueuePendingCommands(commands)
+}
+
+func (c *privateControlClient) newPendingRevocation(request managementServiceAdmissionRevocationRequest) (*privateControlPendingCommand, error) {
+	messageID, err := newPrivateControlID()
+	if err != nil {
+		return nil, err
 	}
 	command := &privateControlPendingCommand{
 		message: privateControlRevokeServiceAdmission{
@@ -476,26 +537,48 @@ func (c *privateControlClient) revokeServiceAdmission(context context.Context, r
 		result: make(chan privateControlCommandResult, 1),
 	}
 	if !validPrivateControlRevocation(command.message) {
-		return privateControlAck{}, "", errors.New("invalid Service Admission revocation command")
+		return nil, errors.New("invalid Service Admission revocation command")
 	}
-	if err := c.enqueuePendingCommand(command); err != nil {
-		return privateControlAck{}, "", err
-	}
-	select {
-	case result := <-command.result:
-		return result.ack, messageID, result.err
-	case <-context.Done():
-		return privateControlAck{}, messageID, context.Err()
-	}
+	return command, nil
 }
 
 func (c *privateControlClient) enqueuePendingCommand(command *privateControlPendingCommand) error {
+	return c.enqueuePendingCommands([]*privateControlPendingCommand{command})
+}
+
+func (c *privateControlClient) enqueuePendingCommands(commands []*privateControlPendingCommand) error {
+	if len(commands) == 0 {
+		return nil
+	}
 	c.commandMu.Lock()
 	defer c.commandMu.Unlock()
-	if len(c.pending) >= privateControlMaxPendingCommands {
+	if len(c.pending)+len(commands) > privateControlMaxPendingCommands {
 		return errors.New("Private Control Link command queue is full")
 	}
-	c.pending[command.message.MessageID] = command
+	added := make([]string, 0, len(commands))
+	seen := make(map[string]struct{}, len(commands))
+	for _, command := range commands {
+		if command == nil || !validPrivateControlRevocation(command.message) {
+			return errors.New("invalid Private Control Link command")
+		}
+		if _, duplicate := c.pending[command.message.MessageID]; duplicate {
+			return errors.New("Private Control Link command message ID is already pending")
+		}
+		if _, duplicate := seen[command.message.MessageID]; duplicate {
+			return errors.New("Private Control Link command batch contains a duplicate message ID")
+		}
+		seen[command.message.MessageID] = struct{}{}
+	}
+	for _, command := range commands {
+		c.pending[command.message.MessageID] = command
+		added = append(added, command.message.MessageID)
+	}
+	if err := c.persistPendingLocked(); err != nil {
+		for _, messageID := range added {
+			delete(c.pending, messageID)
+		}
+		return err
+	}
 	select {
 	case c.commandNotify <- struct{}{}:
 	default:
@@ -513,32 +596,53 @@ func (c *privateControlClient) pendingCommands() []*privateControlPendingCommand
 	return commands
 }
 
-func (c *privateControlClient) completePendingCommand(messageID string, result privateControlCommandResult) bool {
+func (c *privateControlClient) completePendingCommand(messageID string, result privateControlCommandResult) (bool, error) {
 	c.commandMu.Lock()
 	command, found := c.pending[messageID]
-	if found {
-		delete(c.pending, messageID)
+	if !found {
+		c.commandMu.Unlock()
+		return false, nil
+	}
+	delete(c.pending, messageID)
+	if err := c.persistPendingLocked(); err != nil {
+		c.pending[messageID] = command
+		c.commandMu.Unlock()
+		return true, err
 	}
 	c.commandMu.Unlock()
-	if !found {
-		return false
+	select {
+	case command.result <- result:
+	default:
 	}
-	command.result <- result
-	return true
+	return true, nil
 }
 
-func (c *privateControlClient) completePendingAcknowledgement(response privateControlAck) bool {
+func (c *privateControlClient) completePendingAcknowledgement(response privateControlAck) (bool, error) {
 	c.commandMu.Lock()
 	command, found := c.pending[response.InReplyTo]
-	if found && command.message.DenyUntil == response.DenyUntil {
-		delete(c.pending, response.InReplyTo)
+	if !found || command.message.DenyUntil != response.DenyUntil {
+		c.commandMu.Unlock()
+		return false, nil
+	}
+	delete(c.pending, response.InReplyTo)
+	if err := c.persistPendingLocked(); err != nil {
+		c.pending[response.InReplyTo] = command
+		c.commandMu.Unlock()
+		return true, err
 	}
 	c.commandMu.Unlock()
-	if !found || command.message.DenyUntil != response.DenyUntil {
-		return false
+	select {
+	case command.result <- privateControlCommandResult{ack: response}:
+	default:
 	}
-	command.result <- privateControlCommandResult{ack: response}
-	return true
+	return true, nil
+}
+
+func (c *privateControlClient) persistPendingLocked() error {
+	if c.commandStore == nil {
+		return nil
+	}
+	return c.commandStore.persist(c.pending)
 }
 
 func validManagementServiceID(value string) bool {

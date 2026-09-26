@@ -20,7 +20,9 @@ following Management Plane v1 resources are implemented:
   Ed25519-signed grant from the authenticated caller's exact channel ACL.
 - `POST /v1/service-admission-revocations` requires the `admin` API role and
   explicit global `service_admission.revoke` permission. `200` means the Relay
-  acknowledged the PCL command; `202` means it remains queued pending that ACK.
+  acknowledged the PCL command; `202` means it remains queued pending that ACK
+  in the durable PCL command store and will be retried after reconnect or a
+  Management Service restart.
 
 The API never serves a prior connection's state after reconnecting: it returns
 `503 Service Unavailable` for state resources until a fresh complete PCL
@@ -56,6 +58,12 @@ all of the following configuration values:
 - `INCOMUDON_MANAGEMENT_API_EVENT_DELIVERY`: `disabled` (default) or `live`.
   `live` enables non-durable `GET /v1/events`; replay is intentionally not
   supported by this service.
+- `INCOMUDON_MANAGEMENT_API_ACL_RELOAD_INTERVAL`: interval from `1s` through
+  `1m` (default `5s`). The service atomically adopts a complete replacement of
+  all three ACL CSVs only after they all validate. Removed or reduced admission
+  scopes queue channel-scoped PCL revocations; disabled services queue
+  `service_disabled` revocations. Replace the CSV files atomically rather than
+  modifying them in place.
 
 `management-global-permissions.csv` uses this format:
 
@@ -69,6 +77,11 @@ The API rejects a trusted certificate that is absent from the services CSV or
 mapped to a disabled service. A channel-scoped role never implies
 `health.read`. Mount all CSV ACL files and the client CA read-only; protect the
 server private key with the same or stricter access controls.
+
+`INCOMUDON_MANAGEMENT_PCL_COMMAND_STORE_FILE` is mandatory durable state for
+PCL revocations. Mount its parent directory read-write and persist it across
+container restarts; it contains only bounded command metadata, not grants or
+private keys. Keep secrets and the command-store volume separate.
 
 ## Service Admission signing
 
@@ -138,7 +151,8 @@ the Relay through a local UDS volume.
 go run . \
   -pcl-transport uds \
   -pcl-uds-socket-path /run/incomudon-pcl/relay.sock \
-  -pcl-service-id management-main
+  -pcl-service-id management-main \
+  -pcl-command-store-file ./var/pcl-revocations.json
 
 # Cross-host mTLS TCP
 go run . \
@@ -148,5 +162,6 @@ go run . \
   -pcl-service-id management-main \
   -pcl-cert-file ./management-pcl/client.crt \
   -pcl-key-file ./management-pcl/client.key \
-  -pcl-relay-ca-file ./management-pcl/relay-ca.crt
+  -pcl-relay-ca-file ./management-pcl/relay-ca.crt \
+  -pcl-command-store-file ./var/pcl-revocations.json
 ```

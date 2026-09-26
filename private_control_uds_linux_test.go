@@ -71,6 +71,7 @@ func TestPrivateControlClientConsumesLifecycleEventOverUDS(t *testing.T) {
 	state := &managementState{}
 	client, err := newPrivateControlClient(privateControlClientConfig{
 		transport: privateControlTransportUDS, udsSocketPath: socketPath, serviceID: "management-main",
+		commandStoreFile: t.TempDir() + "/pcl-revocations.json",
 	}, state)
 	if err != nil {
 		t.Fatalf("new UDS client: %v", err)

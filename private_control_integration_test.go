@@ -209,12 +209,13 @@ func newPrivateControlTestCredentials(t *testing.T) (*tls.Config, privateControl
 			ClientAuth:   tls.RequireAndVerifyClientCert,
 			ClientCAs:    roots,
 		}, privateControlClientConfig{
-			transport:       privateControlTransportMTLSTCP,
-			serverName:      "relay.test",
-			serviceID:       "management-main",
-			certificateFile: certificatePath,
-			privateKeyFile:  privateKeyPath,
-			relayCAFile:     caPath,
+			transport:        privateControlTransportMTLSTCP,
+			serverName:       "relay.test",
+			serviceID:        "management-main",
+			certificateFile:  certificatePath,
+			privateKeyFile:   privateKeyPath,
+			relayCAFile:      caPath,
+			commandStoreFile: filepath.Join(dataDirectory, "pcl-revocations.json"),
 		}
 }
 

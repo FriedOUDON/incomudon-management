@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -52,6 +53,7 @@ type managementAPIConfig struct {
 	grantAudience         string
 	grantTTLSeconds       string
 	eventDelivery         string
+	aclReloadInterval     string
 }
 
 func (c managementAPIConfig) enabled() bool {
@@ -83,17 +85,23 @@ type managementAdmissionACL struct {
 
 type managementAPIAuthorizer struct {
 	byFingerprint map[string]*managementAPIService
+	byService     map[string]*managementAPIService
 }
 
 type managementAPI struct {
-	state         *managementState
-	authorizer    managementAPIAuthorizer
-	issuer        *serviceAdmissionGrantIssuer
-	revoker       managementServiceAdmissionRevoker
-	liveEvents    *managementLiveEventHub
-	eventDelivery string
-	tlsConfig     *tls.Config
-	listen        string
+	state                 *managementState
+	authorizerMu          sync.RWMutex
+	authorizer            managementAPIAuthorizer
+	servicesFile          string
+	channelACLFile        string
+	globalPermissionsFile string
+	aclReloadInterval     time.Duration
+	issuer                *serviceAdmissionGrantIssuer
+	revoker               managementServiceAdmissionRevoker
+	liveEvents            *managementLiveEventHub
+	eventDelivery         string
+	tlsConfig             *tls.Config
+	listen                string
 }
 
 type managementServiceAdmissionRevoker interface {
@@ -175,19 +183,27 @@ func newManagementAPI(config managementAPIConfig, state *managementState, revoke
 	if eventDelivery != managementAPIEventDeliveryDisabled && eventDelivery != managementAPIEventDeliveryLive {
 		return nil, fmt.Errorf("Management API event delivery must be %q or %q", managementAPIEventDeliveryDisabled, managementAPIEventDeliveryLive)
 	}
+	aclReloadInterval, err := parseManagementACLReloadInterval(config.aclReloadInterval)
+	if err != nil {
+		return nil, err
+	}
 	var liveEvents *managementLiveEventHub
 	if eventDelivery == managementAPIEventDeliveryLive {
 		liveEvents = newManagementLiveEventHub()
 	}
 	state.setLiveEvents(liveEvents)
 	return &managementAPI{
-		state:         state,
-		authorizer:    authorizer,
-		issuer:        issuer,
-		revoker:       revoker,
-		liveEvents:    liveEvents,
-		eventDelivery: eventDelivery,
-		listen:        config.listen,
+		state:                 state,
+		authorizer:            authorizer,
+		servicesFile:          config.servicesFile,
+		channelACLFile:        config.channelACLFile,
+		globalPermissionsFile: config.globalPermissionsFile,
+		aclReloadInterval:     aclReloadInterval,
+		issuer:                issuer,
+		revoker:               revoker,
+		liveEvents:            liveEvents,
+		eventDelivery:         eventDelivery,
+		listen:                config.listen,
 		tlsConfig: &tls.Config{
 			MinVersion:   managementAPIMinimumTLSVersion,
 			Certificates: []tls.Certificate{certificate},
@@ -346,7 +362,7 @@ func loadManagementAPIAuthorizer(servicesFile, channelACLFile, globalPermissions
 			service.globalPermissions[row[1]] = struct{}{}
 		}
 	}
-	return managementAPIAuthorizer{byFingerprint: byFingerprint}, nil
+	return managementAPIAuthorizer{byFingerprint: byFingerprint, byService: byService}, nil
 }
 
 func readManagementCSV(filename string, expectedHeader []string) ([][]string, error) {
@@ -518,7 +534,9 @@ func (a *managementAPI) ServeHTTP(writer http.ResponseWriter, request *http.Requ
 }
 
 func (a *managementAPI) authenticate(writer http.ResponseWriter, request *http.Request) (*managementAPIService, bool) {
+	a.authorizerMu.RLock()
 	service, found := a.authorizer.serviceForRequest(request)
+	a.authorizerMu.RUnlock()
 	if !found {
 		writeManagementAPIError(writer, http.StatusForbidden)
 		return nil, false

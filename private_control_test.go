@@ -388,6 +388,7 @@ func TestManagementStateDoesNotRetainLifecycleEvents(t *testing.T) {
 func TestPrivateControlUDSClientDoesNotRequireTLSMaterial(t *testing.T) {
 	client, err := newPrivateControlClient(privateControlClientConfig{
 		transport: privateControlTransportUDS, udsSocketPath: "/run/incomudon-pcl/relay.sock", serviceID: "management-main",
+		commandStoreFile: t.TempDir() + "/pcl-revocations.json",
 	}, &managementState{})
 	if err != nil {
 		t.Fatalf("new UDS client: %v", err)

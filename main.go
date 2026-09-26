@@ -149,6 +149,9 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	go client.run(ctx)
+	if api != nil {
+		go api.runAuthorizerReload(ctx)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {
@@ -213,6 +216,7 @@ func loadConfiguration() (privateControlClientConfig, string, managementAPIConfi
 	certificateFile := flag.String("pcl-cert-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_CERT_FILE"), "Management Service mTLS client certificate PEM file")
 	privateKeyFile := flag.String("pcl-key-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_KEY_FILE"), "Management Service mTLS client private key PEM file")
 	relayCAFile := flag.String("pcl-relay-ca-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_RELAY_CA_FILE"), "trusted Relay mTLS CA PEM file")
+	commandStoreFile := flag.String("pcl-command-store-file", os.Getenv("INCOMUDON_MANAGEMENT_PCL_COMMAND_STORE_FILE"), "durable Private Control Link revocation command store")
 	httpListen := flag.String("http-listen", valueOrDefault(os.Getenv("INCOMUDON_MANAGEMENT_HTTP_LISTEN"), ":8080"), "local management health listener")
 	apiListen := flag.String("api-listen", os.Getenv("INCOMUDON_MANAGEMENT_API_LISTEN"), "Management API mTLS listener; empty disables the API")
 	apiCertificateFile := flag.String("api-cert-file", os.Getenv("INCOMUDON_MANAGEMENT_API_CERT_FILE"), "Management API server certificate PEM file")
@@ -227,16 +231,18 @@ func loadConfiguration() (privateControlClientConfig, string, managementAPIConfi
 	grantAudience := flag.String("grant-audience", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_AUDIENCE"), "Service Admission JWS Relay audience")
 	grantTTLSeconds := flag.String("grant-ttl-seconds", os.Getenv("INCOMUDON_MANAGEMENT_GRANT_TTL_SECONDS"), "Service Admission grant lifetime in seconds (60..3600)")
 	eventDelivery := flag.String("api-event-delivery", valueOrDefault(os.Getenv("INCOMUDON_MANAGEMENT_API_EVENT_DELIVERY"), managementAPIEventDeliveryDisabled), "Management SSE delivery: disabled or live")
+	aclReloadInterval := flag.String("api-acl-reload-interval", valueOrDefault(os.Getenv("INCOMUDON_MANAGEMENT_API_ACL_RELOAD_INTERVAL"), "5s"), "Management API ACL reload interval")
 	flag.Parse()
 	return privateControlClientConfig{
-			transport:       *transport,
-			relayAddress:    *relayAddress,
-			udsSocketPath:   *udsSocketPath,
-			serverName:      *serverName,
-			serviceID:       *serviceID,
-			certificateFile: *certificateFile,
-			privateKeyFile:  *privateKeyFile,
-			relayCAFile:     *relayCAFile,
+			transport:        *transport,
+			relayAddress:     *relayAddress,
+			udsSocketPath:    *udsSocketPath,
+			serverName:       *serverName,
+			serviceID:        *serviceID,
+			certificateFile:  *certificateFile,
+			privateKeyFile:   *privateKeyFile,
+			relayCAFile:      *relayCAFile,
+			commandStoreFile: *commandStoreFile,
 		}, *httpListen, managementAPIConfig{
 			listen:                *apiListen,
 			certificateFile:       *apiCertificateFile,
@@ -251,6 +257,7 @@ func loadConfiguration() (privateControlClientConfig, string, managementAPIConfi
 			grantAudience:         *grantAudience,
 			grantTTLSeconds:       *grantTTLSeconds,
 			eventDelivery:         *eventDelivery,
+			aclReloadInterval:     *aclReloadInterval,
 		}
 }
 
